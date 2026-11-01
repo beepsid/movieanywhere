@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1115">
+<title>Movie Anywhere</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --card: #1a1d24;
+    --card-hover: #252a33;
+    --text: #f2f3f5;
+    --muted: #9aa0ab;
+    --accent: #e50914;
+    --focus: #ffffff;
+    --radius: 14px;
+    /* Scales smoothly from phone to laptop to TV */
+    --gap: clamp(10px, 1.6vw, 28px);
+    --pad: clamp(16px, 3vw, 64px);
+    --font: clamp(15px, 1.1vw + 8px, 30px);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); }
+  body {
+    font: var(--font)/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    padding: var(--pad);
+    padding-top: max(var(--pad), env(safe-area-inset-top));
+    min-height: 100vh;
+  }
+  header { display: flex; align-items: center; gap: var(--gap); flex-wrap: wrap; margin-bottom: var(--gap); }
+  h1 { margin: 0; font-size: 1.6em; letter-spacing: .5px; }
+  h1 span { color: var(--accent); }
+  .crumbs { display: flex; flex-wrap: wrap; gap: .3em; color: var(--muted); font-size: .9em; width: 100%; }
+  .crumbs a { color: var(--muted); text-decoration: none; padding: .15em .4em; border-radius: 6px; }
+  .crumbs a:hover, .crumbs a:focus { color: var(--text); background: var(--card); outline: none; }
+
+  .search {
+    flex: 1 1 220px; max-width: 520px; margin-left: auto;
+    background: var(--card); color: var(--text); border: 2px solid transparent;
+    border-radius: 999px; padding: .55em 1em; font: inherit;
+  }
+  .search:focus { outline: none; border-color: var(--focus); }
+
+  .grid {
+    display: grid;
+    gap: var(--gap);
+    grid-template-columns: repeat(auto-fill, minmax(clamp(150px, 18vw, 360px), 1fr));
+  }
+  .item {
+    display: flex; flex-direction: column; justify-content: space-between;
+    background: var(--card); color: inherit; text-decoration: none;
+    border-radius: var(--radius); padding: 1em; min-height: 7.5em;
+    border: 3px solid transparent;
+    transition: transform .15s ease, background .15s ease, border-color .15s ease;
+    word-break: break-word;
+  }
+  .item:hover { background: var(--card-hover); }
+  .item:focus { outline: none; border-color: var(--focus); transform: scale(1.04); background: var(--card-hover); }
+  .icon { font-size: 2em; line-height: 1; }
+  .name { font-weight: 600; margin-top: .5em; }
+  .meta { color: var(--muted); font-size: .8em; margin-top: .35em; }
+  .badge { display: inline-block; background: #333a46; border-radius: 6px; padding: 0 .4em; margin-right: .4em; text-transform: uppercase; }
+  .empty, .error { color: var(--muted); padding: 2em 0; }
+
+  /* Player */
+  .player { display: none; }
+  body.watching .browser { display: none; }
+  body.watching .player { display: block; }
+  .player video {
+    width: 100%; max-height: 80vh; background: #000; border-radius: var(--radius); display: block;
+  }
+  .player h2 { font-size: 1.1em; margin: .8em 0 .4em; word-break: break-word; }
+  .actions { display: flex; flex-wrap: wrap; gap: .6em; margin-top: .6em; }
+  .btn {
+    background: var(--card); color: var(--text); border: 3px solid transparent; border-radius: 999px;
+    padding: .5em 1.1em; font: inherit; font-size: .9em; cursor: pointer; text-decoration: none;
+  }
+  .btn:hover { background: var(--card-hover); }
+  .btn:focus { outline: none; border-color: var(--focus); }
+  .btn.primary { background: var(--accent); }
+  .hint { color: var(--muted); font-size: .8em; margin-top: 1em; }
+  .hint.warn { color: #ffb4b4; }
+
+  /* Phones: tighter cards, full-bleed video */
+  @media (max-width: 600px) {
+    .grid { grid-template-columns: 1fr 1fr; }
+    .item { min-height: 6.5em; padding: .8em; }
+    .player video { border-radius: 0; margin: 0 calc(var(--pad) * -1); width: calc(100% + var(--pad) * 2); max-width: none; }
+  }
+  /* Laptops/TVs: let the video use the screen */
+  @media (min-width: 1200px) {
+    .player video { max-height: 82vh; }
+  }
+</style>
+</head>
+<body>
+  <header>
+    <h1>🎬 Movie<span>Anywhere</span></h1>
+    <input class="search" id="search" type="search" placeholder="Search this folder…" aria-label="Search">
+    <nav class="crumbs" id="crumbs"></nav>
+  </header>
+
+  <main class="browser">
+    <div class="grid" id="grid"></div>
+    <div class="empty" id="empty" hidden>No videos in this folder.</div>
+  </main>
+
+  <section class="player" id="player">
+    <video id="video" controls playsinline preload="metadata"></video>
+    <h2 id="title"></h2>
+    <div class="actions">
+      <a class="btn primary" id="back" href="#">← Back</a>
+      <button class="btn" id="fullscreen" type="button">⛶ Fullscreen</button>
+      <a class="btn" id="vlc" href="#">▶ Open in VLC</a>
+      <button class="btn" id="copy" type="button">🔗 Copy link</button>
+    </div>
+    <p class="hint" id="hint">No sound or won't play? Some movies (often .mkv) use audio/video formats the browser can't decode. Tap “Open in VLC” (free app) and it will play everything.</p>
+  </section>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const grid = $("grid"), video = $("video"), search = $("search");
+let items = [];
+
+const enc = (p) => encodeURIComponent(p);
+const fmtSize = (b) => b > 1e9 ? (b / 1e9).toFixed(1) + " GB" : (b / 1e6).toFixed(0) + " MB";
+const prettyName = (n) => n.replace(/\.[^.]+$/, "").replace(/[._]+/g, " ").trim();
+const parentOf = (p) => p.split("/").slice(0, -1).join("/");
+
+// Routes: #/browse/<folder>  and  #/watch/<file>
+function route() {
+  const h = decodeURIComponent(location.hash.slice(1));
+  if (h.startsWith("/watch/")) return showPlayer(h.slice(7));
+  showFolder(h.startsWith("/browse/") ? h.slice(8) : "");
+}
+
+function renderCrumbs(p) {
+  const parts = p ? p.split("/") : [];
+  let html = `<a href="#/browse/">🏠 Movies</a>`;
+  parts.forEach((part, i) => {
+    html += ` / <a href="#/browse/${enc(parts.slice(0, i + 1).join("/"))}">${escapeHtml(part)}</a>`;
+  });
+  $("crumbs").innerHTML = html;
+}
+
+async function showFolder(p) {
+  stopVideo();
+  document.body.classList.remove("watching");
+  renderCrumbs(p);
+  search.hidden = false;
+  grid.innerHTML = "";
+  try {
+    const r = await fetch("/api/list?path=" + enc(p));
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error);
+    items = data.items;
+    if (p) items = [{ type: "up", name: "Back", path: parentOf(p) }, ...items];
+    renderGrid();
+  } catch (e) {
+    grid.innerHTML = `<div class="error">Couldn't load folder: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function renderGrid() {
+  const q = search.value.trim().toLowerCase();
+  const shown = items.filter((i) => i.type === "up" || !q || i.name.toLowerCase().includes(q));
+  grid.innerHTML = shown.map((i) => {
+    if (i.type === "up") return `<a class="item" href="#/browse/${enc(i.path)}"><div class="icon">⬅️</div><div class="name">Back</div></a>`;
+    if (i.type === "folder") return `<a class="item" href="#/browse/${enc(i.path)}"><div class="icon">📁</div><div class="name">${escapeHtml(i.name)}</div><div class="meta">Folder</div></a>`;
+    const resume = getResume(i.path);
+    return `<a class="item" href="#/watch/${enc(i.path)}" title="${escapeHtml(i.name)}">
+      <div class="icon">🎞️</div>
+      <div class="name">${escapeHtml(prettyName(i.name))}</div>
+      <div class="meta"><span class="badge">${i.ext}</span>${fmtSize(i.size)}${resume ? " · resume " + fmtTime(resume) : ""}</div>
+    </a>`;
+  }).join("");
+  $("empty").hidden = shown.some((i) => i.type !== "up");
+  const first = grid.querySelector(".item");
+  if (first && !isTouch()) first.focus({ preventScroll: true });
+}
+
+function showPlayer(p) {
+  document.body.classList.add("watching");
+  search.hidden = true;
+  renderCrumbs(parentOf(p));
+  const name = p.split("/").pop();
+  $("title").textContent = prettyName(name);
+  $("back").href = "#/browse/" + enc(parentOf(p));
+  $("hint").classList.remove("warn");
+
+  const src = "/video?path=" + enc(p);
+  const absUrl = location.origin + src;
+  video.innerHTML = "";
+  video.src = src;
+  // Attach subtitles if a matching .srt/.vtt sits next to the movie.
+  fetch("/subtitle?path=" + enc(p), { method: "GET" }).then((r) => {
+    if (!r.ok) return;
+    const t = document.createElement("track");
+    t.kind = "subtitles"; t.label = "Subtitles"; t.srclang = "en"; t.src = "/subtitle?path=" + enc(p);
+    video.appendChild(t);
+  });
+
+  // Resume where you left off
+  const resume = getResume(p);
+  video.onloadedmetadata = () => { if (resume && resume < video.duration - 30) video.currentTime = resume; };
+  video.ontimeupdate = throttle(() => setResume(p, video.currentTime, video.duration), 3000);
+  video.onerror = () => {
+    const h = $("hint");
+    h.classList.add("warn");
+    h.textContent = "This browser can't play this file's format. Tap “Open in VLC” to watch it there.";
+  };
+  video.play().catch(() => {});
+  video.focus();
+
+  // VLC: Android uses an intent, iPhone/iPad uses VLC's x-callback URL, desktop gets the plain link.
+  const ua = navigator.userAgent;
+  let vlc = absUrl;
+  if (/android/i.test(ua)) vlc = `intent:${absUrl}#Intent;package=org.videolan.vlc;type=video/*;end`;
+  else if (/iphone|ipad|ipod/i.test(ua)) vlc = `vlc-x-callback://x-callback-url/stream?url=${enc(absUrl)}`;
+  $("vlc").href = vlc;
+  $("copy").onclick = async () => {
+    try { await navigator.clipboard.writeText(absUrl); $("copy").textContent = "✅ Copied"; }
+    catch { prompt("Copy this link:", absUrl); }
+    setTimeout(() => ($("copy").textContent = "🔗 Copy link"), 2000);
+  };
+}
+
+function stopVideo() {
+  video.pause();
+  video.removeAttribute("src");
+  video.load();
+}
+
+$("fullscreen").onclick = () => {
+  if (video.requestFullscreen) video.requestFullscreen();
+  else if (video.webkitEnterFullscreen) video.webkitEnterFullscreen(); // iPhone
+};
+
+// ---- Resume position (stored on each device) ----
+function getResume(p) { try { return Number(localStorage.getItem("pos:" + p)) || 0; } catch { return 0; } }
+function setResume(p, t, d) {
+  try {
+    if (d && t > d - 30) localStorage.removeItem("pos:" + p);
+    else if (t > 10) localStorage.setItem("pos:" + p, Math.floor(t));
+  } catch {}
+}
+function fmtTime(s) { const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60); return h ? `${h}h ${m}m` : `${m}m`; }
+function throttle(fn, ms) { let last = 0; return () => { const n = Date.now(); if (n - last > ms) { last = n; fn(); } }; }
+function escapeHtml(s) { return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
+function isTouch() { return matchMedia("(pointer: coarse)").matches; }
+
+// ---- TV remote / keyboard: arrow keys move between cards ----
+document.addEventListener("keydown", (e) => {
+  const watching = document.body.classList.contains("watching");
+  if (e.key === "Backspace" || e.key === "Escape" || e.key === "BrowserBack" || e.keyCode === 10009 /* Samsung */ || e.keyCode === 461 /* LG */) {
+    if (document.activeElement === search && e.key === "Backspace") return;
+    if (document.fullscreenElement) return;
+    e.preventDefault();
+    location.hash = watching ? $("back").getAttribute("href") : "#/browse/" + enc(parentOf(currentFolder()));
+    return;
+  }
+  if (watching) {
+    if (document.activeElement === video) {
+      if (e.key === "ArrowRight") { video.currentTime += 10; e.preventDefault(); }
+      else if (e.key === "ArrowLeft") { video.currentTime -= 10; e.preventDefault(); }
+      else if (e.key === "Enter" || e.key === " ") { video.paused ? video.play() : video.pause(); e.preventDefault(); }
+      else if (e.key === "ArrowDown") { $("back").focus(); e.preventDefault(); }
+    } else if (e.key === "ArrowUp") { video.focus(); e.preventDefault(); }
+    else moveFocus(e, ".actions .btn");
+    return;
+  }
+  if (document.activeElement === search && !["ArrowDown"].includes(e.key)) return;
+  moveFocus(e, ".item, #search, .crumbs a");
+});
+
+function currentFolder() {
+  const h = decodeURIComponent(location.hash.slice(1));
+  return h.startsWith("/browse/") ? h.slice(8) : "";
+}
+
+// Spatial navigation: jump to the nearest element in the arrow's direction.
+function moveFocus(e, selector) {
+  const dirs = { ArrowUp: [0, -1], ArrowDown: [0, 1], ArrowLeft: [-1, 0], ArrowRight: [1, 0] };
+  const d = dirs[e.key];
+  if (!d) return;
+  const els = [...document.querySelectorAll(selector)].filter((el) => el.offsetParent);
+  const cur = document.activeElement;
+  if (!els.includes(cur)) { els[0] && els[0].focus(); e.preventDefault(); return; }
+  const r = cur.getBoundingClientRect(), cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+  let best = null, bestScore = Infinity;
+  for (const el of els) {
+    if (el === cur) continue;
+    const b = el.getBoundingClientRect(), x = b.left + b.width / 2 - cx, y = b.top + b.height / 2 - cy;
+    const along = x * d[0] + y * d[1];
+    if (along <= 1) continue;
+    const across = Math.abs(x * d[1]) + Math.abs(y * d[0]);
+    const score = along + across * 2;
+    if (score < bestScore) { bestScore = score; best = el; }
+  }
+  if (best) { best.focus(); best.scrollIntoView({ block: "nearest", behavior: "smooth" }); e.preventDefault(); }
+}
+
+search.addEventListener("input", renderGrid);
+window.addEventListener("hashchange", route);
+route();
+</script>
+</body>
+</html>
