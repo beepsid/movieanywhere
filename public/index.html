@@ -79,6 +79,10 @@
   .btn:hover { background: var(--card-hover); }
   .btn:focus { outline: none; border-color: var(--focus); }
   .btn.primary { background: var(--accent); }
+  .preparing { background: var(--card); border-radius: var(--radius); padding: 1.2em; margin-bottom: 1em; }
+  .preparing p { margin: 0 0 .7em; }
+  .bar { height: .5em; background: #333a46; border-radius: 999px; overflow: hidden; }
+  .bar div { height: 100%; width: 0; background: var(--accent); transition: width .5s ease; }
   .hint { color: var(--muted); font-size: .8em; margin-top: 1em; }
   .hint.warn { color: #ffb4b4; }
 
@@ -107,6 +111,11 @@
   </main>
 
   <section class="player" id="player">
+    <div class="preparing" id="preparing" hidden>
+      <p id="prepText">Preparing…</p>
+      <div class="bar"><div id="prepBar"></div></div>
+      <p class="hint">This only happens the first time you open this movie.</p>
+    </div>
     <video id="video" controls playsinline preload="metadata"></video>
     <h2 id="title"></h2>
     <div class="actions">
@@ -191,9 +200,44 @@ function showPlayer(p) {
 
   const src = "/video?path=" + enc(p);
   const absUrl = location.origin + src;
+  stopVideo();
   video.innerHTML = "";
+  setupLinks(absUrl);
+  const token = (playToken = {});
+  $("hint").textContent = DEFAULT_HINT;
+
+  // Ask the server whether the file needs a one-time conversion for sound to work.
+  const check = async () => {
+    if (token !== playToken) return; // user navigated away
+    let s;
+    try { s = await (await fetch("/api/prepare?path=" + enc(p))).json(); }
+    catch { s = { status: "direct" }; }
+    if (token !== playToken) return;
+    if (s.status === "preparing") {
+      $("preparing").hidden = false;
+      $("prepText").textContent = `Preparing this movie so it plays with sound on every device… ${s.progress}%`;
+      $("prepBar").style.width = s.progress + "%";
+      return setTimeout(check, 1500);
+    }
+    $("preparing").hidden = true;
+    if (s.status === "failed") {
+      $("hint").classList.add("warn");
+      $("hint").textContent = "Couldn't prepare this file (" + s.error + "). Try “Open in VLC”.";
+    } else if (s.warning) {
+      $("hint").classList.add("warn");
+      $("hint").textContent = s.warning + " Try “Open in VLC”.";
+    }
+    startPlayback(p, src);
+  };
+  check();
+}
+
+let playToken = null;
+const DEFAULT_HINT = document.getElementById("hint").textContent;
+
+function startPlayback(p, src) {
   video.src = src;
-  // Attach subtitles if a matching .srt/.vtt sits next to the movie.
+  // Attach subtitles if a matching .srt/.vtt sits next to the movie (or was extracted from it).
   fetch("/subtitle?path=" + enc(p), { method: "GET" }).then((r) => {
     if (!r.ok) return;
     const t = document.createElement("track");
@@ -205,14 +249,19 @@ function showPlayer(p) {
   const resume = getResume(p);
   video.onloadedmetadata = () => { if (resume && resume < video.duration - 30) video.currentTime = resume; };
   video.ontimeupdate = throttle(() => setResume(p, video.currentTime, video.duration), 3000);
+  video.onplaying = () => { if (!$("hint").classList.contains("warn")) return; if (!video.error) { $("hint").classList.remove("warn"); $("hint").textContent = DEFAULT_HINT; } };
   video.onerror = () => {
+    // Ignore errors left over from the player being reset; only report real decode failures.
+    if (!video.error || !video.currentSrc.endsWith(src)) return;
     const h = $("hint");
     h.classList.add("warn");
     h.textContent = "This browser can't play this file's format. Tap “Open in VLC” to watch it there.";
   };
   video.play().catch(() => {});
   video.focus();
+}
 
+function setupLinks(absUrl) {
   // VLC: Android uses an intent, iPhone/iPad uses VLC's x-callback URL, desktop gets the plain link.
   const ua = navigator.userAgent;
   let vlc = absUrl;
@@ -227,6 +276,8 @@ function showPlayer(p) {
 }
 
 function stopVideo() {
+  playToken = null;
+  $("preparing").hidden = true;
   video.pause();
   video.removeAttribute("src");
   video.load();

@@ -4,10 +4,37 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const crypto = require("crypto");
+const { spawn, execFileSync } = require("child_process");
 
 const MOVIE_DIR = path.resolve(process.env.MOVIE_DIR || "C:\\local\\movie");
 const PORT = Number(process.env.PORT || 8080);
 const PUBLIC_DIR = path.join(__dirname, "public");
+const CACHE_DIR = path.resolve(process.env.CACHE_DIR || path.join(__dirname, "cache"));
+
+// Locate ffmpeg/ffprobe: env var, PATH, or the winget install location.
+function findTool(name) {
+  const candidates = [
+    process.env[name.toUpperCase()],
+    name,
+    path.join(process.env.LOCALAPPDATA || "", "Microsoft", "WinGet", "Links", name + ".exe"),
+    ...wingetPackageBins(name),
+  ].filter(Boolean);
+  for (const c of candidates) {
+    try { execFileSync(c, ["-version"], { stdio: "ignore" }); return c; } catch {}
+  }
+  return null;
+}
+// winget sometimes skips the Links alias; look inside its package folder (…\Gyan.FFmpeg_*\ffmpeg-*\bin).
+function wingetPackageBins(name) {
+  const root = path.join(process.env.LOCALAPPDATA || "", "Microsoft", "WinGet", "Packages");
+  try {
+    return fs.readdirSync(root).filter((d) => /ffmpeg/i.test(d)).flatMap((d) =>
+      fs.readdirSync(path.join(root, d)).map((sub) => path.join(root, d, sub, "bin", name + ".exe")));
+  } catch { return []; }
+}
+const FFMPEG = findTool("ffmpeg");
+const FFPROBE = findTool("ffprobe");
 
 const VIDEO_TYPES = {
   ".mp4": "video/mp4",
@@ -100,8 +127,142 @@ function streamFile(req, res, file, type) {
   });
 }
 
-// Find a matching subtitle file (movie.srt / movie.vtt / movie.en.srt ...) next to a video.
+// ---- Making files playable in every browser ----
+
+const BROWSER_AUDIO = new Set(["aac", "mp3"]);
+const BROWSER_VIDEO = new Set(["h264", "hevc"]);
+const TEXT_SUBS = new Set(["subrip", "ass", "ssa", "webvtt", "mov_text"]);
+const jobs = new Map(); // cacheKey -> { progress, error }
+const probes = new Map();
+
+function cacheKey(file) {
+  const st = fs.statSync(file);
+  return crypto.createHash("sha1").update(`${file}|${st.size}|${st.mtimeMs}`).digest("hex").slice(0, 16);
+}
+const cachedVideo = (key) => path.join(CACHE_DIR, key + ".mp4");
+const cachedSub = (key) => path.join(CACHE_DIR, key + ".vtt");
+
+function probe(file) {
+  if (probes.has(file)) return Promise.resolve(probes.get(file));
+  return new Promise((resolve, reject) => {
+    const p = spawn(FFPROBE, ["-v", "error", "-show_entries", "format=duration:stream=index,codec_type,codec_name:stream_tags=language", "-of", "json", file]);
+    let out = "";
+    p.stdout.on("data", (d) => (out += d));
+    p.on("error", reject);
+    p.on("close", (code) => {
+      if (code !== 0) return reject(new Error("ffprobe failed"));
+      const info = JSON.parse(out);
+      probes.set(file, info);
+      resolve(info);
+    });
+  });
+}
+
+function needsConversion(file, info) {
+  const ext = path.extname(file).toLowerCase();
+  const v = info.streams.find((s) => s.codec_type === "video");
+  const a = info.streams.find((s) => s.codec_type === "audio");
+  const okContainer = ext === ".mp4" || ext === ".m4v";
+  const okVideo = v && BROWSER_VIDEO.has(v.codec_name);
+  const okAudio = !a || BROWSER_AUDIO.has(a.codec_name);
+  return !(okContainer && okVideo && okAudio);
+}
+
+// Prefer an audio track in the user's language order (Hindi, then English), else the first.
+function pickAudio(info) {
+  const audio = info.streams.filter((s) => s.codec_type === "audio");
+  for (const lang of ["hin", "eng"]) {
+    const s = audio.find((x) => x.tags && x.tags.language === lang);
+    if (s) return s;
+  }
+  return audio[0];
+}
+
+function startConversion(file, key, info) {
+  if (jobs.has(key)) return;
+  fs.mkdirSync(CACHE_DIR, { recursive: true });
+  const job = { progress: 0, error: null };
+  jobs.set(key, job);
+  const duration = Number(info.format.duration) || 0;
+  const v = info.streams.find((s) => s.codec_type === "video");
+  const a = pickAudio(info);
+  const part = cachedVideo(key) + ".part";
+
+  const args = ["-y", "-v", "error", "-i", file, "-map", `0:${v.index}`];
+  if (a) {
+    args.push("-map", `0:${a.index}`);
+    if (BROWSER_AUDIO.has(a.codec_name)) args.push("-c:a", "copy");
+    else args.push("-c:a", "aac", "-ac", "2", "-b:a", "192k");
+  }
+  args.push("-c:v", "copy");
+  if (v.codec_name === "hevc") args.push("-tag:v", "hvc1"); // needed for Safari/iPhone
+  args.push("-movflags", "+faststart", "-f", "mp4", "-progress", "pipe:1", part);
+
+  const p = spawn(FFMPEG, args);
+  let err = "";
+  p.stderr.on("data", (d) => (err += d));
+  p.stdout.on("data", (d) => {
+    const m = /out_time_us=(\d+)/g;
+    let hit, last;
+    while ((hit = m.exec(d.toString()))) last = hit;
+    if (last && duration) job.progress = Math.min(99, Math.round(Number(last[1]) / 1e6 / duration * 100));
+  });
+  p.on("close", (code) => {
+    if (code === 0) {
+      fs.renameSync(part, cachedVideo(key));
+      jobs.delete(key);
+      console.log(`  Ready: ${path.basename(file)}`);
+    } else {
+      job.error = err.trim().split("\n").pop() || "Conversion failed";
+      fs.rm(part, { force: true }, () => {});
+      console.error(`  Failed: ${path.basename(file)}: ${job.error}`);
+    }
+  });
+  console.log(`  Preparing: ${path.basename(file)}`);
+
+  // Pull out the first text subtitle track (English preferred) as WebVTT.
+  const subs = info.streams.filter((s) => s.codec_type === "subtitle" && TEXT_SUBS.has(s.codec_name));
+  const sub = subs.find((s) => s.tags && s.tags.language === "eng") || subs[0];
+  if (sub && !fs.existsSync(cachedSub(key))) {
+    spawn(FFMPEG, ["-y", "-v", "error", "-i", file, "-map", `0:${sub.index}`, "-f", "webvtt", cachedSub(key)]);
+  }
+}
+
+// Tells the page whether a file can play right away, is being prepared, or can't be fixed.
+async function prepare(res, rel) {
+  const file = safeResolve(rel);
+  if (!file || !VIDEO_TYPES[path.extname(file).toLowerCase()] || !fs.existsSync(file)) return sendJson(res, 404, { error: "Not found" });
+  if (!FFMPEG || !FFPROBE) return sendJson(res, 200, { status: "direct", warning: "ffmpeg is not installed, so files with unsupported audio may play silently." });
+  try {
+    const key = cacheKey(file);
+    if (fs.existsSync(cachedVideo(key))) return sendJson(res, 200, { status: "ready" });
+    const info = await probe(file);
+    if (!needsConversion(file, info)) return sendJson(res, 200, { status: "direct" });
+    startConversion(file, key, info);
+    const job = jobs.get(key);
+    if (job.error) { jobs.delete(key); return sendJson(res, 200, { status: "failed", error: job.error }); }
+    sendJson(res, 200, { status: "preparing", progress: job.progress });
+  } catch (e) {
+    sendJson(res, 200, { status: "direct", warning: e.message });
+  }
+}
+
+// Serve the browser-friendly copy if one exists, otherwise the original file.
+function playableFile(file) {
+  try {
+    const c = cachedVideo(cacheKey(file));
+    if (fs.existsSync(c)) return { file: c, type: "video/mp4" };
+  } catch {}
+  return { file, type: VIDEO_TYPES[path.extname(file).toLowerCase()] };
+}
+
+// Find a matching subtitle file (movie.srt / movie.vtt / movie.en.srt ...) next to a video,
+// or one extracted from inside the movie.
 function findSubtitle(videoFile) {
+  try {
+    const c = cachedSub(cacheKey(videoFile));
+    if (fs.existsSync(c) && fs.statSync(c).size > 10) return c;
+  } catch {}
   const dir = path.dirname(videoFile);
   const base = path.basename(videoFile, path.extname(videoFile)).toLowerCase();
   try {
@@ -137,11 +298,13 @@ const server = http.createServer((req, res) => {
 
   if (url.pathname === "/api/list") return listDir(res, p);
 
+  if (url.pathname === "/api/prepare") return prepare(res, p);
+
   if (url.pathname === "/video") {
     const file = safeResolve(p);
-    const type = file && VIDEO_TYPES[path.extname(file).toLowerCase()];
-    if (!type) { res.writeHead(400); return res.end("Bad path"); }
-    return streamFile(req, res, file, type);
+    if (!file || !VIDEO_TYPES[path.extname(file).toLowerCase()]) { res.writeHead(400); return res.end("Bad path"); }
+    const play = playableFile(file);
+    return streamFile(req, res, play.file, play.type);
   }
 
   if (url.pathname === "/subtitle") {
@@ -170,4 +333,5 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log(`  On this laptop:      http://localhost:${PORT}`);
   for (const ip of ips) console.log(`  On phone / TV:       http://${ip}:${PORT}`);
   console.log(`\n  (Devices must be on the same Wi-Fi. Press Ctrl+C to stop.)\n`);
+  if (!FFMPEG || !FFPROBE) console.log("  ffmpeg not found: movies with Dolby/DTS audio may have no sound.\n  Install it with:  winget install Gyan.FFmpeg\n");
 });
